@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Data and generated artifacts
+*.fits
+*.fits.gz
+*.npz
+*.pt
+*.pth
+outputs/
+runs/
+hybrid_ensemble/runs/
+splits/*.npz
+*.csv
+*.json
+
+# Notebooks
+.ipynb_checkpoints/
+

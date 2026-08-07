@@ -1,0 +1,16 @@
+[project]
+name = "csst-dla-model-zoo"
+version = "0.1.0"
+description = "Model zoo workspace for CSST DLA detection experiments."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
