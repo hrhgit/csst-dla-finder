@@ -1,9 +1,11 @@
-# Hybrid Ensemble
+# Dilated ResNet Five-Head Ensemble
 
-This branch contains the hybrid DLA detector:
+This branch keeps the hybrid pipeline's data preparation, decoding, evaluation,
+and prediction scripts, while replacing its CNN with the local dilated
+five-head residual architecture:
 
 - multi-channel 1D spectrum features
-- shared 1D CNN backbone
+- 1D dilated residual backbone with layer normalization
 - heatmap, broad-region, `LOGNHI`, count, and optional offset heads
 - weighted ensemble evaluation and prediction
 - configurable DLA redshift lower bound via `--min-z-dla`
@@ -67,7 +69,7 @@ PYTHONPATH=src python3 hybrid_ensemble/train_hybrid.py \
   --train-fits /path/to/train.fits \
   --out-dir hybrid_ensemble/runs/member_all_seed42 \
   --input-mode all \
-  --hidden 32 \
+  --hidden 96 \
   --num-blocks 4 \
   --epochs 25 \
   --batch-size 128 \
@@ -124,4 +126,3 @@ PYTHONPATH=src python3 hybrid_ensemble/predict_hybrid.py \
   --out hybrid_ensemble/runs/submission_hybrid.csv \
   --device auto
 ```
-

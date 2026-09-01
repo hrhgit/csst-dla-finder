@@ -36,7 +36,7 @@ def write_submission(out_path: str | Path, dataset: HybridTestDataset, pred: dic
     cal = config.get("lognhi_calibration", {"slope": 1.0, "intercept": 0.0})
     slope = float(cal.get("slope", 1.0))
     intercept = float(cal.get("intercept", 0.0))
-    lognhi_clip_min = float(config.get("lognhi_clip_min", 20.3))
+    lognhi_clip_min = float(config.get("lognhi_clip_min", 19.5))
     lognhi_clip_max = float(config.get("lognhi_clip_max", 22.5))
     count_prob = softmax(pred['count_logits'] + count_bias[None,:])
     # if "count_prob" in pred and np.allclose(count_bias, 0.0):
@@ -112,10 +112,14 @@ def main() -> None:
     parser.add_argument("--test-fits", default="test.fits")
     parser.add_argument("--out", default="hybrid_ensemble/runs/submission_hybrid.csv")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu", "mps"], default="auto")
+    parser.add_argument("--lognhi-clip-min", type=float, default=19.5)
+    parser.add_argument("--lognhi-clip-max", type=float, default=22.5)
     args = parser.parse_args()
 
     config = json.loads(Path(args.ensemble_config).read_text(encoding="utf-8"))
+    config["lognhi_clip_min"] = args.lognhi_clip_min
+    config["lognhi_clip_max"] = args.lognhi_clip_max
     device = resolve_device(args.device)
     preds = []
     weights = []

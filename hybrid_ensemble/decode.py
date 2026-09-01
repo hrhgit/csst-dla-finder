@@ -133,6 +133,8 @@ def decode_validation_catalog(
     min_z_dla: float = 1.55,
     count_bias: list[float] | None = None,
     count_min_prob: float = 0.0,
+    lognhi_min: float = 19.5,
+    lognhi_max: float = 22.5,
     lognhi_slope: float = 1.0,
     lognhi_intercept: float = 0.0,
     velocity_offset_kms: float = 0.0,
@@ -178,7 +180,7 @@ def decode_validation_catalog(
             z_dla = float(lambda_dla / LYA - 1.0)
             if velocity_offset_kms:
                 z_dla = z_dla + velocity_offset_kms / 299792.458 * (1.0 + z_dla)
-            lognhi_out = float(np.clip(lognhi_slope * raw_log + lognhi_intercept, 20.3, 22.5))
+            lognhi_out = float(np.clip(lognhi_slope * raw_log + lognhi_intercept, lognhi_min, lognhi_max))
             confidence = float(pred["heatmap"][row, pix] * count_prob[row, n_pick])
             snr = float(labels["SNR_GU"][idx])
             if (
@@ -226,6 +228,8 @@ def fit_lognhi_calibration(
     min_z_dla: float = 1.55,
     count_bias: list[float] | None = None,
     count_min_prob: float = 0.0,
+    lognhi_min: float = 19.5,
+    lognhi_max: float = 22.5,
     velocity_offset_kms: float = 0.0,
     soft_radius: int = 0,
     soft_power: float = 3.0,
@@ -243,6 +247,8 @@ def fit_lognhi_calibration(
         min_z_dla=min_z_dla,
         count_bias=count_bias,
         count_min_prob=count_min_prob,
+        lognhi_min=lognhi_min,
+        lognhi_max=lognhi_max,
         velocity_offset_kms=velocity_offset_kms,
         soft_radius=soft_radius,
         soft_power=soft_power,
@@ -251,7 +257,7 @@ def fit_lognhi_calibration(
         low_lognhi_max=low_lognhi_max,
         low_lognhi_snr_max=low_lognhi_snr_max,
     )
-    truth = labels_to_truth(labels, indices, min_lognhi=20.3)
+    truth = labels_to_truth(labels, indices, min_lognhi=lognhi_min)
     matches = greedy_match(truth, raw_catalog)
     if len(matches) < 3:
         return 1.0, 0.0, len(matches)

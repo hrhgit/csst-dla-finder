@@ -23,6 +23,8 @@ from decode import average_predictions, decode_validation_catalog, predict_membe
 
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
         return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     return torch.device(name)
 
@@ -38,10 +40,19 @@ def focal_bce_with_logits(logits, target, alpha=0.85, gamma=2.0, weight=None):
     return loss.mean()
 
 
-def train_one_epoch(model, loader, opt, device, args):
+def balanced_class_weights(counts: np.ndarray, power: float) -> list[float]:
+    class_counts = np.bincount(counts, minlength=3).astype(np.float64)
+    if np.any(class_counts == 0):
+        raise ValueError("count head requires all three classes in the training split")
+    weights = (len(counts) / (3.0 * class_counts)) ** power
+    return (weights / weights.mean()).astype(np.float32).tolist()
+
+
+def train_one_epoch(model, loader, opt, device, args, count_class_weights=None, epoch=0):
     model.train()
     total = 0.0
-    for x, center, region, lognhi, mask, offset, offset_weight, count, _ in loader:
+    progress_every = max(1, len(loader) // 5)
+    for batch_idx, (x, center, region, lognhi, mask, offset, offset_weight, count, _) in enumerate(loader):
         x = x.to(device)
         center = center.to(device)
         region = region.to(device)
@@ -67,7 +78,9 @@ def train_one_epoch(model, loader, opt, device, args):
             offset_loss = offset_loss / offset_weight.sum().clamp_min(1.0)
         else:
             offset_loss = torch.tensor(0.0, device=device)
-        count_loss = nn.functional.cross_entropy(out["count_logits"], count)
+        count_loss = nn.functional.cross_entropy(
+            out["count_logits"], count, weight=count_class_weights
+        )
         loss = (
             center_loss
             + args.region_loss_weight * region_loss
@@ -79,6 +92,19 @@ def train_one_epoch(model, loader, opt, device, args):
         loss.backward()
         opt.step()
         total += float(loss.detach().cpu()) * len(x)
+        if batch_idx == 0 or (batch_idx + 1) % progress_every == 0:
+            print(
+                json.dumps(
+                    {
+                        "progress": "train",
+                        "epoch": epoch,
+                        "batch": batch_idx + 1,
+                        "total_batches": len(loader),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
     return total / len(loader.dataset)
 
 
@@ -87,9 +113,28 @@ def main() -> None:
     parser.add_argument("--targets", default="outputs/cnn_targets_seed42.npz")
     parser.add_argument("--train-fits", default="train.fits")
     parser.add_argument("--out-dir", default="hybrid_ensemble/runs/member_all_seed42")
-    parser.add_argument("--input-mode", choices=["flux", "residual", "all"], default="all")
-    parser.add_argument("--hidden", type=int, default=32)
-    parser.add_argument("--num-blocks", type=int, default=6)
+    parser.add_argument("--input-mode", choices=["raw", "flux", "residual", "all"], default="all")
+    parser.add_argument("--hidden", type=int, default=96, help="DilatedResNet base channel width.")
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        choices=[2, 3, 4, 5],
+        default=4,
+        help="Number of wavelength-resolution-aware DilatedResNet stages.",
+    )
+    parser.add_argument(
+        "--norm-type",
+        choices=["batch", "layer"],
+        default="layer",
+        help="Normalization used inside the local five-head architecture.",
+    )
+    parser.add_argument(
+        "--head-layers",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="Number of layers in each local five-head output head.",
+    )
     parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -100,34 +145,106 @@ def main() -> None:
     parser.add_argument("--lognhi-loss-weight", type=float, default=0.05)
     parser.add_argument("--offset-loss-weight", type=float, default=0.1)
     parser.add_argument("--count-loss-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--count-class-weight-power",
+        type=float,
+        default=0.0,
+        help="0 keeps unweighted cross entropy; 1 uses inverse-frequency weights.",
+    )
+    parser.add_argument(
+        "--truth-min-lognhi",
+        type=float,
+        default=20.3,
+        help="Minimum LOGNHI used when constructing validation truth for model selection.",
+    )
     parser.add_argument("--high-lognhi-threshold", type=float, default=22.0)
     parser.add_argument("--high-lognhi-center-weight", type=float, default=4.0)
     parser.add_argument("--high-lognhi-log-weight", type=float, default=4.0)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu", "mps"], default="auto")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    train_ds = HybridTrainDataset(
+        args.targets,
+        args.train_fits,
+        "train",
+        args.input_mode,
+        max_samples=args.max_train_samples,
+        cache_channels=True,
+    )
+    val_ds = HybridTrainDataset(
+        args.targets,
+        args.train_fits,
+        "val",
+        args.input_mode,
+        max_samples=args.max_val_samples,
+        cache_channels=True,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=args.norm_type == "batch",
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=args.num_workers > 0,
+    )
+    # BatchNorm cannot update statistics from a singleton training batch.
+    # Drop only that final partial batch; validation remains in eval mode.
+    # Validation data is already cached in the parent process. Keeping it out
+    # of worker IPC avoids sharing one large backing array per batch and is
+    # faster for this small validation split.
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+    )
+
     device = resolve_device(args.device)
 
-    train_ds = HybridTrainDataset(
-        args.targets, args.train_fits, "train", args.input_mode, max_samples=args.max_train_samples
+    train_counts = np.asarray(train_ds.count, dtype=np.int64)
+    class_counts = np.bincount(train_counts, minlength=3).tolist()
+    class_weights = balanced_class_weights(train_counts, args.count_class_weight_power)
+    count_class_weights = (
+        torch.tensor(class_weights, dtype=torch.float32, device=device)
+        if args.count_class_weight_power > 0.0
+        else None
     )
-    val_ds = HybridTrainDataset(args.targets, args.train_fits, "val", args.input_mode, max_samples=args.max_val_samples)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    print(
+        json.dumps(
+            {
+                "train_count_distribution": dict(enumerate(class_counts)),
+                "count_class_weights": class_weights,
+                "truth_min_lognhi": args.truth_min_lognhi,
+                "target_min_lognhi": val_ds.target_min_lognhi,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
-    model = HybridDlaNet(input_channels(args.input_mode), hidden=args.hidden, num_blocks=args.num_blocks, with_offset=True).to(device)
+    model = HybridDlaNet(
+        input_channels(args.input_mode),
+        hidden=args.hidden,
+        num_blocks=args.num_blocks,
+        with_offset=True,
+        norm_type=args.norm_type,
+        head_layers=args.head_layers,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     history = []
     best_score = -1.0
     for epoch in range(1, args.epochs + 1):
-        loss = train_one_epoch(model, train_loader, opt, device, args)
+        loss = train_one_epoch(model, train_loader, opt, device, args, count_class_weights, epoch=epoch)
         pred = predict_member(model, val_loader, device)
         avg = average_predictions([pred])
         catalog = decode_validation_catalog(
@@ -137,8 +254,9 @@ def main() -> None:
             val_ds.wavelength,
             threshold=args.threshold,
             min_z_dla=args.min_z_dla,
+            lognhi_min=args.truth_min_lognhi,
         )
-        truth = labels_to_truth(val_ds.labels, val_ds.indices, min_lognhi=20.3)
+        truth = labels_to_truth(val_ds.labels, val_ds.indices, min_lognhi=args.truth_min_lognhi)
         score = score_catalog(truth, catalog)
         row = {
             "epoch": epoch,
@@ -165,9 +283,12 @@ def main() -> None:
                         "hidden": args.hidden,
                         "num_blocks": args.num_blocks,
                         "with_offset": True,
+                        "norm_type": args.norm_type,
+                        "head_layers": args.head_layers,
                     },
                     "threshold": args.threshold,
                     "score": row,
+                    "training_config": vars(args),
                 },
                 out_dir / "best_model.pt",
             )
@@ -175,13 +296,22 @@ def main() -> None:
     torch.save(
         {
             "model_state": model.state_dict(),
-            "config": {"input_mode": args.input_mode, "hidden": args.hidden, "num_blocks": args.num_blocks, "with_offset": True},
+            "config": {
+                "input_mode": args.input_mode,
+                "hidden": args.hidden,
+                "num_blocks": args.num_blocks,
+                "with_offset": True,
+                "norm_type": args.norm_type,
+                "head_layers": args.head_layers,
+            },
             "threshold": args.threshold,
             "score": history[-1],
+            "training_config": vars(args),
         },
         out_dir / "model.pt",
     )
     (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    (out_dir / "training_args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     print(f"wrote {out_dir / 'best_model.pt'}")
 
 

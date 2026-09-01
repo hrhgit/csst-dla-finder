@@ -1,70 +1,17 @@
+"""Compatibility adapter for the local dilated five-head DLA architecture.
+
+The surrounding hybrid pipeline intentionally keeps its established data,
+training, decoding, evaluation, and checkpoint conventions.  This module only
+maps the local model's output semantics to that pipeline's model contract.
+"""
 from __future__ import annotations
 
-import torch
-from torch import nn
-
-
-class ResidualBlock1d(nn.Module):
-    def __init__(self, channels: int, kernel_size: int = 7, dilation: int = 1):
-        super().__init__()
-        padding = dilation * (kernel_size // 2)
-        self.net = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm1d(channels),
-            nn.SiLU(),
-            nn.Conv1d(channels, channels, 1),
-            nn.BatchNorm1d(channels),
-        )
-        self.act = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.net(x))
-
-
-class HybridDlaNet(nn.Module):
-    """Shared 1D CNN with heatmap, LOGNHI, broad-region, and count heads."""
-
-    def __init__(self, in_channels: int, hidden: int = 32, num_blocks: int = 6, with_offset: bool = True):
-        super().__init__()
-        self.with_offset = with_offset
-        dilations = [1, 2, 4, 8, 16, 32][:num_blocks]
-        self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, hidden, kernel_size=9, padding=4),
-            nn.BatchNorm1d(hidden),
-            nn.SiLU(),
-        )
-        self.blocks = nn.ModuleList([ResidualBlock1d(hidden, dilation=d) for d in dilations])
-        self.pixel_head = nn.Sequential(
-            nn.Conv1d(hidden, hidden, kernel_size=7, padding=3),
-            nn.BatchNorm1d(hidden),
-            nn.SiLU(),
-            nn.Conv1d(hidden, 4 if with_offset else 3, kernel_size=1),
-        )
-        self.count_head = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, 3),
-        )
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        feat = self.stem(x)
-        for block in self.blocks:
-            feat = block(feat)
-        pixel = self.pixel_head(feat)
-        pooled = torch.cat([feat.mean(dim=-1), feat.amax(dim=-1)], dim=1)
-        out = {
-            "center_logits": pixel[:, 0],
-            "region_logits": pixel[:, 1],
-            "lognhi_raw": pixel[:, 2],
-            "count_logits": self.count_head(pooled),
-        }
-        if self.with_offset:
-            out["offset_raw"] = pixel[:, 3]
-        return out
+from models.dilated_resnet_5head import _build_dilated_resnet_5head
 
 
 def input_channels(input_mode: str) -> int:
+    if input_mode == "raw":
+        return 1
     if input_mode == "flux":
         return 6
     if input_mode == "residual":
@@ -72,3 +19,63 @@ def input_channels(input_mode: str) -> int:
     if input_mode == "all":
         return 8
     raise ValueError(f"unknown input_mode: {input_mode}")
+
+
+def _stages_for(num_blocks: int) -> list[tuple[int, int]]:
+    """Use the local architecture's layouts for the 681-pixel data grid."""
+    layouts = {
+        2: [(1, 1), (2, 1)],
+        3: [(1, 1), (2, 1), (4, 2)],
+        4: [(1, 1), (2, 1), (4, 2), (4, 2)],
+        5: [(1, 1), (2, 1), (4, 2), (4, 2), (4, 2)],
+    }
+    if num_blocks not in layouts:
+        raise ValueError("num_blocks must be one of 2, 3, 4, or 5 for dilated-resnet-5head")
+    return layouts[num_blocks]
+
+
+class HybridDlaNet:
+    """Expose the local DilatedResNet5Head through the hybrid pipeline contract."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden: int = 96,
+        num_blocks: int = 4,
+        with_offset: bool = True,
+        norm_type: str = "layer",
+        head_layers: int = 1,
+    ):
+        self.with_offset = with_offset
+        self.model = _build_dilated_resnet_5head(
+            n_bins=0,
+            in_channels=in_channels,
+            width=hidden,
+            stages=_stages_for(num_blocks),
+            use_skip=False,
+            use_se=False,
+            norm_type=norm_type,
+            head_layers=head_layers,
+        )
+
+    def to(self, *args, **kwargs):
+        self.model.to(*args, **kwargs)
+        return self
+
+    def __getattr__(self, name):
+        if name in {"model", "with_offset"}:
+            return object.__getattribute__(self, name)
+        return getattr(self.model, name)
+
+    def __call__(self, x):
+        local = self.model(x)
+        output = {
+            "center_logits": local["heat_logits"],
+            "region_logits": local["region_logits"],
+            # Local: 20.5 + 1.5 * raw. Pipeline: 20.3 + raw.
+            "lognhi_raw": 0.2 + 1.5 * local["lognhi"],
+            "count_logits": local["count_prob"],
+        }
+        if self.with_offset:
+            output["offset_raw"] = local["offset"]
+        return output

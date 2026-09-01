@@ -22,6 +22,8 @@ from model import HybridDlaNet, input_channels
 
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
         return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     return torch.device(name)
 
@@ -34,6 +36,8 @@ def load_checkpoint(path: str | Path, device: torch.device):
         hidden=int(cfg.get("hidden", 32)),
         num_blocks=int(cfg.get("num_blocks", 6)),
         with_offset=bool(cfg.get("with_offset", False)),
+        norm_type=str(cfg.get("norm_type", "layer")),
+        head_layers=int(cfg.get("head_layers", 1)),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     return model, cfg
@@ -50,6 +54,14 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.45)
     parser.add_argument("--min-distance", type=int, default=10)
     parser.add_argument("--min-z-dla", type=float, default=1.55)
+    parser.add_argument(
+        "--truth-min-lognhi",
+        type=float,
+        default=19.5,
+        help="Minimum LOGNHI used to construct validation truth.",
+    )
+    parser.add_argument("--lognhi-min", type=float, default=19.5)
+    parser.add_argument("--lognhi-max", type=float, default=22.5)
     parser.add_argument("--count-bias", nargs=3, type=float, default=[0.0, 0.0, 0.0])
     parser.add_argument(
         "--count-min-prob",
@@ -70,7 +82,7 @@ def main() -> None:
     parser.add_argument("--low-lognhi-max", type=float, default=20.5)
     parser.add_argument("--low-lognhi-snr-max", type=float, default=3.0)
     parser.add_argument("--fit-lognhi-calibration", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu", "mps"], default="auto")
     args = parser.parse_args()
 
     if args.weights is not None and len(args.weights) != len(args.models):
@@ -102,6 +114,8 @@ def main() -> None:
             min_z_dla=args.min_z_dla,
             count_bias=args.count_bias,
             count_min_prob=args.count_min_prob,
+            lognhi_min=args.lognhi_min,
+            lognhi_max=args.lognhi_max,
             velocity_offset_kms=args.velocity_offset_kms,
             soft_radius=args.soft_radius,
             soft_power=args.soft_power,
@@ -120,6 +134,8 @@ def main() -> None:
         min_z_dla=args.min_z_dla,
         count_bias=args.count_bias,
         count_min_prob=args.count_min_prob,
+        lognhi_min=args.lognhi_min,
+        lognhi_max=args.lognhi_max,
         lognhi_slope=slope,
         lognhi_intercept=intercept,
         velocity_offset_kms=args.velocity_offset_kms,
@@ -130,15 +146,18 @@ def main() -> None:
         low_lognhi_max=args.low_lognhi_max,
         low_lognhi_snr_max=args.low_lognhi_snr_max,
     )
-    truth = labels_to_truth(ref_ds.labels, ref_ds.indices, min_lognhi=20.3)
+    truth = labels_to_truth(ref_ds.labels, ref_ds.indices, min_lognhi=args.truth_min_lognhi)
     score = score_catalog(truth, pred_catalog)
     result = {
         "models": member_configs,
         "threshold": args.threshold,
         "min_distance": args.min_distance,
         "min_z_dla": args.min_z_dla,
+        "truth_min_lognhi": args.truth_min_lognhi,
         "count_bias": args.count_bias,
         "count_min_prob": args.count_min_prob,
+        "lognhi_min": args.lognhi_min,
+        "lognhi_max": args.lognhi_max,
         "velocity_offset_kms": args.velocity_offset_kms,
         "soft_radius": args.soft_radius,
         "soft_power": args.soft_power,
@@ -178,8 +197,10 @@ def main() -> None:
                 "threshold": args.threshold,
                 "min_distance": args.min_distance,
                 "min_z_dla": args.min_z_dla,
-                "count_bias": args.count_bias,
-                "count_min_prob": args.count_min_prob,
+        "count_bias": args.count_bias,
+        "count_min_prob": args.count_min_prob,
+        "lognhi_min": args.lognhi_min,
+        "lognhi_max": args.lognhi_max,
                 "velocity_offset_kms": args.velocity_offset_kms,
                 "soft_radius": args.soft_radius,
                 "soft_power": args.soft_power,

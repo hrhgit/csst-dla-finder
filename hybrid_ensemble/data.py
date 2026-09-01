@@ -95,7 +95,11 @@ def build_channels(
     snr_channel = np.full_like(flux, snr, dtype=np.float32)
     blue_mask = (wavelength < LYA * (1.0 + z_qso)).astype(np.float32)
     smooth = smooth_flux(flux, 15)
-    if input_mode == "flux":
+    if input_mode == "raw":
+        # Local-architecture entry point: one median-normalized raw-flux channel
+        # is built by the upstream FITS reader; keep the channel layout intact.
+        channels = [flux]
+    elif input_mode == "flux":
         channels = [flux, smooth, zq_channel, snr_channel, wave_norm, blue_mask]
     elif input_mode == "residual":
         if clean is None:
@@ -112,6 +116,18 @@ def build_channels(
     return np.stack(channels, axis=0).astype(np.float32)
 
 
+def channel_count(input_mode: str) -> int:
+    if input_mode == "raw":
+        return 1
+    if input_mode == "flux":
+        return 6
+    if input_mode == "residual":
+        return 7
+    if input_mode == "all":
+        return 8
+    raise ValueError(f"unknown input_mode: {input_mode}")
+
+
 class HybridTrainDataset(Dataset):
     def __init__(
         self,
@@ -120,17 +136,33 @@ class HybridTrainDataset(Dataset):
         split: str,
         input_mode: str = "all",
         max_samples: int | None = None,
+        cache_channels: bool = False,
     ):
-        self.data = np.load(targets_npz)
         self.labels = read_labels(train_fits)
         self.input_mode = input_mode
-        self.wavelength = self.data["wavelength"].astype(np.float32)
+        with np.load(targets_npz) as source:
+            self.target_min_lognhi = (
+                float(source["target_min_lognhi"])
+                if "target_min_lognhi" in source.files
+                else 20.3
+            )
+            self.wavelength = source["wavelength"].astype(np.float32)
+            self.indices = source[f"{split}_idx"]
+            self.center = source[f"{split}_center"]
+            if f"{split}_region" in source.files:
+                self.region = source[f"{split}_region"]
+            else:
+                self.region = self.center
+            self.lognhi = source[f"{split}_lognhi"]
+            self.mask = source[f"{split}_mask"]
+            self.x_all = source["x"]
+            self.clean_all = None
+            if self.input_mode in {"residual", "all"}:
+                if "x_clean" not in source.files:
+                    raise ValueError(f"input_mode={self.input_mode} requires x_clean")
+                self.clean_all = source["x_clean"]
+            self.snr = source["snr_proxy"][self.indices].astype(np.float32)
         self.wave_norm = wavelength_norm(self.wavelength)
-        self.indices = self.data[f"{split}_idx"]
-        self.center = self.data[f"{split}_center"]
-        self.region = self.data[f"{split}_region"] if f"{split}_region" in self.data.files else self.center
-        self.lognhi = self.data[f"{split}_lognhi"]
-        self.mask = self.data[f"{split}_mask"]
         self.offset, self.offset_weight = make_offset_targets(self.wavelength, self.labels, self.indices)
         if max_samples is not None:
             self.indices = self.indices[:max_samples]
@@ -140,28 +172,47 @@ class HybridTrainDataset(Dataset):
             self.mask = self.mask[:max_samples]
             self.offset = self.offset[:max_samples]
             self.offset_weight = self.offset_weight[:max_samples]
-        self.x_all = self.data["x"]
-        self.clean_all = self.data["x_clean"] if "x_clean" in self.data.files else None
-        self.snr = self.data["snr_proxy"][self.indices].astype(np.float32)
         self.zq = self.labels["Z_QSO"][self.indices].astype(np.float32)
-        min_lognhi = float(self.data["target_min_lognhi"]) if "target_min_lognhi" in self.data.files else 20.3
+        min_lognhi = self.target_min_lognhi
         self.count = make_scored_count_targets(self.labels, self.indices, min_lognhi=min_lognhi)
+        self.channels = self._build_channel_cache() if cache_channels else None
 
     def __len__(self) -> int:
         return len(self.indices)
 
+    def _build_channel_cache(self) -> np.ndarray:
+        cached = np.empty(
+            (len(self), channel_count(self.input_mode), len(self.wavelength)),
+            dtype=np.float32,
+        )
+        for i in range(len(self)):
+            clean = None if self.clean_all is None else self.clean_all[self.indices[i]].astype(np.float32)
+            cached[i] = build_channels(
+                self.x_all[self.indices[i]].astype(np.float32),
+                clean,
+                self.wavelength,
+                self.wave_norm,
+                float(self.zq[i]),
+                float(self.snr[i]),
+                self.input_mode,
+            )
+        return cached
+
     def __getitem__(self, i: int):
         idx = int(self.indices[i])
-        clean = None if self.clean_all is None else self.clean_all[idx].astype(np.float32)
-        x = build_channels(
-            self.x_all[idx].astype(np.float32),
-            clean,
-            self.wavelength,
-            self.wave_norm,
-            float(self.zq[i]),
-            float(self.snr[i]),
-            self.input_mode,
-        )
+        if self.channels is not None:
+            x = self.channels[i].copy()
+        else:
+            clean = None if self.clean_all is None else self.clean_all[idx].astype(np.float32)
+            x = build_channels(
+                self.x_all[idx].astype(np.float32),
+                clean,
+                self.wavelength,
+                self.wave_norm,
+                float(self.zq[i]),
+                float(self.snr[i]),
+                self.input_mode,
+            )
         return (
             torch.from_numpy(x),
             torch.from_numpy(self.center[i].astype(np.float32)),
