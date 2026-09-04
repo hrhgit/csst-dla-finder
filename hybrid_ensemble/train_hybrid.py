@@ -113,7 +113,7 @@ def main() -> None:
     parser.add_argument("--targets", default="outputs/cnn_targets_seed42.npz")
     parser.add_argument("--train-fits", default="train.fits")
     parser.add_argument("--out-dir", default="hybrid_ensemble/runs/member_all_seed42")
-    parser.add_argument("--input-mode", choices=["raw", "flux", "residual", "all"], default="all")
+    parser.add_argument("--input-mode", choices=["raw", "flux", "residual", "all", "all_wzx"], default="all")
     parser.add_argument("--hidden", type=int, default=96, help="DilatedResNet base channel width.")
     parser.add_argument(
         "--num-blocks",

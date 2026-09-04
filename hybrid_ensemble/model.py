@@ -18,6 +18,8 @@ def input_channels(input_mode: str) -> int:
         return 7
     if input_mode == "all":
         return 8
+    if input_mode == "all_wzx":
+        return 11
     raise ValueError(f"unknown input_mode: {input_mode}")
 
 

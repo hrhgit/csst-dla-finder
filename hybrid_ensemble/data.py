@@ -17,6 +17,78 @@ def normalize_with_scale(flux: np.ndarray, scale: np.ndarray, eps: float = 1e-30
     return np.clip(x, 0.0, 3.0).astype(np.float32)
 
 
+def normalize_wzx_style(flux: np.ndarray, eps: float = 1e-30) -> np.ndarray:
+    """Per-spectrum median/std normalization used by the WZX input branch.
+
+    The existing hybrid channels retain their percentile scaling.  Adding this
+    view gives an early-fusion model both normalizations without changing the
+    original eight-channel layout.
+    """
+    values = np.asarray(flux, dtype=np.float32)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.zeros_like(values, dtype=np.float32)
+    median = np.float32(np.median(values[finite]))
+    filled = np.where(finite, values, median).astype(np.float32, copy=False)
+    std = np.float32(np.std(filled))
+    if not np.isfinite(std) or std < eps:
+        std = np.float32(1.0)
+    return np.nan_to_num((filled - median) / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def build_wzx_style_channels(flux: np.ndarray, clean: np.ndarray) -> np.ndarray:
+    """The exact three spectral channels consumed by WZX in ``feature_mode=all``."""
+    residual = np.asarray(clean, dtype=np.float32) - np.asarray(flux, dtype=np.float32)
+    return np.stack(
+        [normalize_wzx_style(flux), normalize_wzx_style(clean), normalize_wzx_style(residual)],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
+def _normalize_wzx_style_rows(values: np.ndarray, eps: float = 1e-30, block_size: int = 4096) -> np.ndarray:
+    """Vectorized row-wise form of :func:`normalize_wzx_style`.
+
+    It keeps the exact per-spectrum statistic but avoids a Python call for all
+    500,000 spectra when materializing fusion caches.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"expected [rows, wavelength], got {values.shape}")
+    output = np.empty_like(values, dtype=np.float32)
+    for start in range(0, len(values), block_size):
+        stop = min(len(values), start + block_size)
+        block = values[start:stop]
+        finite = np.isfinite(block)
+        has_finite = finite.any(axis=1)
+        with np.errstate(invalid="ignore"):
+            median = np.nanmedian(np.where(finite, block, np.nan), axis=1).astype(np.float32)
+        median = np.where(has_finite, median, 0.0).astype(np.float32)
+        filled = np.where(finite, block, median[:, None]).astype(np.float32, copy=False)
+        std = np.std(filled, axis=1).astype(np.float32)
+        std = np.where(has_finite & np.isfinite(std) & (std >= eps), std, 1.0).astype(np.float32)
+        output[start:stop] = np.nan_to_num(
+            (filled - median[:, None]) / std[:, None], nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+    return output
+
+
+def build_wzx_style_channels_rows(flux: np.ndarray, clean: np.ndarray) -> np.ndarray:
+    """Vectorized exact WZX views for a batch of raw spectra."""
+    flux = np.asarray(flux, dtype=np.float32)
+    clean = np.asarray(clean, dtype=np.float32)
+    if flux.shape != clean.shape or flux.ndim != 2:
+        raise ValueError("flux and clean must be same-shape [rows, wavelength] arrays")
+    residual = clean - flux
+    return np.stack(
+        [
+            _normalize_wzx_style_rows(flux),
+            _normalize_wzx_style_rows(clean),
+            _normalize_wzx_style_rows(residual),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
 def smooth_flux(flux: np.ndarray, width: int = 15) -> np.ndarray:
     kernel = np.ones(width, dtype=np.float32) / float(width)
     return np.convolve(flux, kernel, mode="same").astype(np.float32)
@@ -106,11 +178,19 @@ def build_channels(
             raise ValueError("input_mode=residual requires FLUX_CLEAN")
         residual = clean - flux
         channels = [flux, clean, residual, zq_channel, snr_channel, wave_norm, blue_mask]
-    elif input_mode == "all":
+    elif input_mode in {"all", "all_wzx"}:
         if clean is None:
-            raise ValueError("input_mode=all requires FLUX_CLEAN")
+            raise ValueError(f"input_mode={input_mode} requires FLUX_CLEAN")
         residual = clean - flux
         channels = [flux, clean, residual, smooth, zq_channel, snr_channel, wave_norm, blue_mask]
+        if input_mode == "all_wzx":
+            channels.extend(
+                [
+                    normalize_wzx_style(flux),
+                    normalize_wzx_style(clean),
+                    normalize_wzx_style(residual),
+                ]
+            )
     else:
         raise ValueError(f"unknown input_mode: {input_mode}")
     return np.stack(channels, axis=0).astype(np.float32)
@@ -125,6 +205,8 @@ def channel_count(input_mode: str) -> int:
         return 7
     if input_mode == "all":
         return 8
+    if input_mode == "all_wzx":
+        return 11
     raise ValueError(f"unknown input_mode: {input_mode}")
 
 
@@ -157,11 +239,19 @@ class HybridTrainDataset(Dataset):
             self.mask = source[f"{split}_mask"]
             self.x_all = source["x"]
             self.clean_all = None
-            if self.input_mode in {"residual", "all"}:
+            if self.input_mode in {"residual", "all", "all_wzx"}:
                 if "x_clean" not in source.files:
                     raise ValueError(f"input_mode={self.input_mode} requires x_clean")
                 self.clean_all = source["x_clean"]
             self.snr = source["snr_proxy"][self.indices].astype(np.float32)
+        self.wzx_raw_flux_all = None
+        self.wzx_raw_clean_all = None
+        if self.input_mode == "all_wzx":
+            # The WZX views must be built before hybrid's percentile scaling
+            # and clipping; otherwise their pretrained input distribution is
+            # not faithfully reproduced.
+            self.wzx_raw_flux_all = read_image(train_fits, "FLUX").astype(np.float32)
+            self.wzx_raw_clean_all = read_image(train_fits, "FLUX_CLEAN").astype(np.float32)
         self.wave_norm = wavelength_norm(self.wavelength)
         self.offset, self.offset_weight = make_offset_targets(self.wavelength, self.labels, self.indices)
         if max_samples is not None:
@@ -187,14 +277,24 @@ class HybridTrainDataset(Dataset):
         )
         for i in range(len(self)):
             clean = None if self.clean_all is None else self.clean_all[self.indices[i]].astype(np.float32)
-            cached[i] = build_channels(
+            base_mode = "all" if self.input_mode == "all_wzx" else self.input_mode
+            base = build_channels(
                 self.x_all[self.indices[i]].astype(np.float32),
                 clean,
                 self.wavelength,
                 self.wave_norm,
                 float(self.zq[i]),
                 float(self.snr[i]),
-                self.input_mode,
+                base_mode,
+            )
+            if self.input_mode == "all_wzx":
+                cached[i, :8] = base
+            else:
+                cached[i] = base
+        if self.input_mode == "all_wzx":
+            cached[:, -3:] = build_wzx_style_channels_rows(
+                self.wzx_raw_flux_all[self.indices],
+                self.wzx_raw_clean_all[self.indices],
             )
         return cached
 
@@ -213,6 +313,8 @@ class HybridTrainDataset(Dataset):
                 float(self.snr[i]),
                 self.input_mode,
             )
+            if self.input_mode == "all_wzx":
+                x[-3:] = build_wzx_style_channels(self.wzx_raw_flux_all[idx], self.wzx_raw_clean_all[idx])
         return (
             torch.from_numpy(x),
             torch.from_numpy(self.center[i].astype(np.float32)),
@@ -234,9 +336,11 @@ class HybridTestDataset(Dataset):
         scale = np.percentile(flux, 75, axis=1, keepdims=True).astype(np.float32)
         self.x_all = normalize_with_scale(flux, scale)
         self.clean_all = None
-        if input_mode in {"residual", "all"}:
+        if input_mode in {"residual", "all", "all_wzx"}:
             clean = read_image(test_fits, "FLUX_CLEAN").astype(np.float32)
             self.clean_all = normalize_with_scale(clean, scale)
+        self.wzx_raw_flux_all = flux if input_mode == "all_wzx" else None
+        self.wzx_raw_clean_all = clean if input_mode == "all_wzx" else None
         self.wave_norm = wavelength_norm(self.wavelength)
         self.snr = estimate_snr_gu_proxy(self.wavelength, flux).astype(np.float32)
         self.meta = read_meta(test_fits)
@@ -257,4 +361,6 @@ class HybridTestDataset(Dataset):
             float(self.snr[i]),
             self.input_mode,
         )
+        if self.input_mode == "all_wzx":
+            x[-3:] = build_wzx_style_channels(self.wzx_raw_flux_all[i], self.wzx_raw_clean_all[i])
         return torch.from_numpy(x), int(i)
