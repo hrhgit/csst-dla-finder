@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import maximum_filter1d, median_filter, uniform_filter1d
 from torch.utils.data import Dataset
 
 from csst_dla.fits_utils import read_image, read_labels, read_meta
@@ -89,9 +90,145 @@ def build_wzx_style_channels_rows(flux: np.ndarray, clean: np.ndarray) -> np.nda
     ).astype(np.float32, copy=False)
 
 
+WZX_FEATURE_MODES = frozenset({"flux", "flux_clean", "residual", "flux_residual", "all"})
+
+
+def wzx_feature_requires_clean(feature_mode: str) -> bool:
+    """Return whether the WZX spectral view needs FLUX_CLEAN."""
+    if feature_mode not in WZX_FEATURE_MODES:
+        raise ValueError(f"unknown WZX feature_mode={feature_mode!r}")
+    return feature_mode != "flux"
+
+
+def build_wzx_feature_channels(
+    flux: np.ndarray,
+    clean: np.ndarray | None,
+    feature_mode: str,
+) -> np.ndarray:
+    """Build one WZX-compatible spectral view without inventing clean inputs.
+
+    The channel order follows csst_dla_wzx_pkg.data. This lets feature fusion
+    use a flux-only WZX checkpoint without materializing the clean FITS input.
+    """
+    if feature_mode not in WZX_FEATURE_MODES:
+        raise ValueError(f"unknown WZX feature_mode={feature_mode!r}")
+    flux = np.asarray(flux, dtype=np.float32)
+    if flux.ndim != 1:
+        raise ValueError(f"expected one spectrum [wavelength], got {flux.shape}")
+    if wzx_feature_requires_clean(feature_mode):
+        if clean is None:
+            raise ValueError(f"WZX feature_mode={feature_mode!r} requires clean")
+        clean = np.asarray(clean, dtype=np.float32)
+        if clean.shape != flux.shape:
+            raise ValueError("flux and clean must have matching shapes")
+        residual = clean - flux
+    else:
+        residual = None
+    channels: list[np.ndarray] = []
+    if feature_mode in {"flux", "flux_residual", "all"}:
+        channels.append(normalize_wzx_style(flux))
+    if feature_mode in {"flux_clean", "all"}:
+        channels.append(normalize_wzx_style(clean))
+    if feature_mode in {"residual", "flux_residual", "all"}:
+        channels.append(normalize_wzx_style(residual))
+    return np.stack(channels, axis=0).astype(np.float32, copy=False)
+
+
+def build_wzx_feature_channels_rows(
+    flux: np.ndarray,
+    clean: np.ndarray | None,
+    feature_mode: str,
+) -> np.ndarray:
+    """Vectorized build_wzx_feature_channels for many spectra."""
+    if feature_mode not in WZX_FEATURE_MODES:
+        raise ValueError(f"unknown WZX feature_mode={feature_mode!r}")
+    flux = np.asarray(flux, dtype=np.float32)
+    if flux.ndim != 2:
+        raise ValueError(f"expected [rows, wavelength], got {flux.shape}")
+    if wzx_feature_requires_clean(feature_mode):
+        if clean is None:
+            raise ValueError(f"WZX feature_mode={feature_mode!r} requires clean")
+        clean = np.asarray(clean, dtype=np.float32)
+        if clean.shape != flux.shape:
+            raise ValueError("flux and clean must have matching shapes")
+        residual = clean - flux
+    else:
+        residual = None
+    channels: list[np.ndarray] = []
+    if feature_mode in {"flux", "flux_residual", "all"}:
+        channels.append(_normalize_wzx_style_rows(flux))
+    if feature_mode in {"flux_clean", "all"}:
+        channels.append(_normalize_wzx_style_rows(clean))
+    if feature_mode in {"residual", "flux_residual", "all"}:
+        channels.append(_normalize_wzx_style_rows(residual))
+    return np.stack(channels, axis=1).astype(np.float32, copy=False)
+
+
 def smooth_flux(flux: np.ndarray, width: int = 15) -> np.ndarray:
     kernel = np.ones(width, dtype=np.float32) / float(width)
     return np.convolve(flux, kernel, mode="same").astype(np.float32)
+
+
+# --- engineered channels (flux-only, challenge compliant) -------------------
+# 8 A/pixel sampling makes a DLA core sub-pixel: the discriminative structure is
+# a one-or-two-pixel dip riding on damping wings a few pixels wide, buried in a
+# noise level that varies along the spectrum.  A convolutional stem reproduces
+# any *linear* filter of the flux for free, so the only useful additions are
+# non-linear statistics that a conv/attention stack cannot synthesise itself:
+# a robust *median*-based local noise scale, a *min*-pooled trough depth, and a
+# *max*-over-scales matched filter.
+SIGMA_WINDOW = 31  # ~250 A: wide enough for a stable local noise estimate
+TROUGH_WINDOW = 11  # ~88 A: +-5 px, the probe's search window
+MF_WIDTHS = (1, 3, 7, 15)
+SIG_CLIP = 12.0
+MF_CLIP = 20.0
+
+
+def local_noise_sigma(high_pass: np.ndarray, width: int = SIGMA_WINDOW) -> np.ndarray:
+    """Per-pixel robust noise scale of a high-pass spectrum, via a sliding MAD.
+
+    ``median_filter`` is a non-linear operator: no stack of convolutions can
+    reproduce it, so this is genuine added accessibility rather than a
+    re-parameterisation of the flux channel.
+    """
+    width = int(width) | 1
+    median = median_filter(high_pass, size=width, mode="reflect")
+    mad = median_filter(np.abs(high_pass - median), size=width, mode="reflect")
+    return (1.4826 * mad).astype(np.float32)
+
+
+def sliding_min(values: np.ndarray, width: int = TROUGH_WINDOW) -> np.ndarray:
+    """Deepest value inside a centred window (min-pooling, non-linear)."""
+    return (-maximum_filter1d(-values, size=int(width) | 1, mode="reflect")).astype(np.float32)
+
+
+def multiscale_matched_filter(significance: np.ndarray, widths=MF_WIDTHS) -> np.ndarray:
+    """Matched-filter SNR for top-hat absorption templates of several widths.
+
+    With unit-variance noise the optimal statistic for a boxcar of width ``w``
+    is the windowed sum divided by ``sqrt(w)``.  Absorption is a negative
+    excursion, so the response is sign-flipped; the strongest scale is kept.
+    """
+    response = None
+    for width in widths:
+        width = int(width) | 1
+        smoothed = uniform_filter1d(significance, size=width, mode="reflect")
+        current = -(smoothed * np.sqrt(float(width))).astype(np.float32)
+        response = current if response is None else np.maximum(response, current)
+    return response.astype(np.float32)
+
+
+def build_engineered_views(
+    flux: np.ndarray, smooth: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (significance, trough, matched_filter) built from flux alone."""
+    residual = (flux - smooth).astype(np.float32)
+    sigma = local_noise_sigma(residual)
+    significance = np.clip(residual / np.maximum(sigma, 1e-6), -SIG_CLIP, SIG_CLIP).astype(np.float32)
+    trough = np.clip(sliding_min(significance), -SIG_CLIP, SIG_CLIP).astype(np.float32)
+    matched = np.clip(multiscale_matched_filter(significance), 0.0, MF_CLIP).astype(np.float32)
+    return significance, trough, matched
+
 
 
 def wavelength_norm(wavelength: np.ndarray) -> np.ndarray:
@@ -173,6 +310,49 @@ def build_channels(
         channels = [flux]
     elif input_mode == "flux":
         channels = [flux, smooth, zq_channel, snr_channel, wave_norm, blue_mask]
+    elif input_mode == "flux_aug":
+        # flux (6ch) + derived high-frequency views from raw FLUX only.
+        # resid = flux - smooth15 (continuum-removed absorption signature)
+        # grad  = np.gradient(flux) (edge strength, localizes DLA boundary)
+        #
+        # DEPRECATED for transformer towers.  resid = (I - B15) flux and
+        # grad = D flux are *exact linear* functions of the flux channel, so a
+        # single convolution reproduces them at zero cost and they add
+        # I(Y; resid, grad | flux) = 0.  Measured: +4.7 pp on the weak CNN but
+        # -1.5 pp (v3c) / -3.5 pp (SOTA) on transformers.  Use ``flux``,
+        # ``flux_sig`` or ``flux_feat`` instead.
+        resid = (flux - smooth).astype(np.float32)
+        grad = np.gradient(flux).astype(np.float32)
+        channels = [flux, smooth, zq_channel, snr_channel, wave_norm, blue_mask, resid, grad]
+    elif input_mode == "flux_sig":
+        # flux (6ch) + local noise-normalised significance.  Unlike resid this
+        # is non-linear (sliding MAD), so the conv stem cannot synthesise it.
+        significance, _, _ = build_engineered_views(flux, smooth)
+        channels = [
+            flux,
+            smooth,
+            zq_channel,
+            snr_channel,
+            wave_norm,
+            blue_mask,
+            significance,
+        ]
+    elif input_mode == "flux_feat":
+        # flux_sig (7ch) + two classic non-linear absorption detectors:
+        # trough = deepest significance in a window (min-pooled)
+        # mf     = strongest multi-scale matched-filter response
+        significance, trough, matched = build_engineered_views(flux, smooth)
+        channels = [
+            flux,
+            smooth,
+            zq_channel,
+            snr_channel,
+            wave_norm,
+            blue_mask,
+            significance,
+            trough,
+            matched,
+        ]
     elif input_mode == "residual":
         if clean is None:
             raise ValueError("input_mode=residual requires FLUX_CLEAN")
@@ -201,6 +381,12 @@ def channel_count(input_mode: str) -> int:
         return 1
     if input_mode == "flux":
         return 6
+    if input_mode == "flux_aug":
+        return 8
+    if input_mode == "flux_sig":
+        return 7
+    if input_mode == "flux_feat":
+        return 9
     if input_mode == "residual":
         return 7
     if input_mode == "all":

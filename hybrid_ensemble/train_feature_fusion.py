@@ -136,6 +136,8 @@ def save_checkpoint(path: Path, model, args, epoch_row: dict, dilated_config: di
                 "wzx_checkpoint": args.wzx_checkpoint,
                 "dilated_config": dilated_config,
                 "wzx_config": wzx_config,
+                "dilated_input_mode": args.dilated_input_mode,
+                "wzx_feature_mode": args.wzx_feature_mode,
             },
             "threshold": args.threshold,
             "score": epoch_row,
@@ -182,14 +184,41 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = resolve_device(args.device)
-    print(json.dumps({"stage": "loading_datasets", "merge_mode": args.merge_mode}, ensure_ascii=False), flush=True)
-    train_ds = DualFusionTrainDataset(args.targets, args.train_fits, "train", args.max_train_samples)
-    val_ds = DualFusionTrainDataset(args.targets, args.train_fits, "val", args.max_val_samples)
+    dilated_wrapper, dilated_config = load_checkpoint(args.dilated_checkpoint, device)
+    wzx_model, wzx_config = load_model_from_checkpoint(args.wzx_checkpoint, device)
+    args.dilated_input_mode = str(dilated_config.get("input_mode", "all"))
+    args.wzx_feature_mode = str(wzx_config.get("feature_mode", "all"))
+    print(
+        json.dumps(
+            {
+                "stage": "loading_datasets",
+                "merge_mode": args.merge_mode,
+                "dilated_input_mode": args.dilated_input_mode,
+                "wzx_feature_mode": args.wzx_feature_mode,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    train_ds = DualFusionTrainDataset(
+        args.targets,
+        args.train_fits,
+        "train",
+        args.max_train_samples,
+        dilated_input_mode=args.dilated_input_mode,
+        wzx_feature_mode=args.wzx_feature_mode,
+    )
+    val_ds = DualFusionTrainDataset(
+        args.targets,
+        args.train_fits,
+        "val",
+        args.max_val_samples,
+        dilated_input_mode=args.dilated_input_mode,
+        wzx_feature_mode=args.wzx_feature_mode,
+    )
     print(json.dumps({"stage": "datasets_ready", "train": len(train_ds), "val": len(val_ds)}, ensure_ascii=False), flush=True)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=False)
-    dilated_wrapper, dilated_config = load_checkpoint(args.dilated_checkpoint, device)
-    wzx_model, wzx_config = load_model_from_checkpoint(args.wzx_checkpoint, device)
     model = DualTowerFusionNet(
         dilated_wrapper.model,
         wzx_model,

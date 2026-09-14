@@ -10,11 +10,17 @@ from torch import nn
 import torch.nn.functional as F
 
 from csst_dla.fits_utils import read_image
-from data import HybridTestDataset, HybridTrainDataset, build_wzx_style_channels, build_wzx_style_channels_rows
+from data import (
+    HybridTestDataset,
+    HybridTrainDataset,
+    build_wzx_feature_channels,
+    build_wzx_feature_channels_rows,
+    wzx_feature_requires_clean,
+)
 
 
-def build_wzx_views(flux: np.ndarray, clean: np.ndarray) -> np.ndarray:
-    return build_wzx_style_channels(flux, clean)
+def build_wzx_views(flux: np.ndarray, clean: np.ndarray | None, feature_mode: str = "all") -> np.ndarray:
+    return build_wzx_feature_channels(flux, clean, feature_mode)
 
 
 class DualFusionTrainDataset(HybridTrainDataset):
@@ -26,18 +32,30 @@ class DualFusionTrainDataset(HybridTrainDataset):
         train_fits: str | Path,
         split: str,
         max_samples: int | None = None,
+        dilated_input_mode: str = "all",
+        wzx_feature_mode: str = "all",
     ):
+        self.dilated_input_mode = dilated_input_mode
+        self.wzx_feature_mode = wzx_feature_mode
         super().__init__(
             targets_npz,
             train_fits,
             split,
-            input_mode="all",
+            input_mode=dilated_input_mode,
             max_samples=max_samples,
             cache_channels=True,
         )
         raw_flux = read_image(train_fits, "FLUX").astype(np.float32)
-        raw_clean = read_image(train_fits, "FLUX_CLEAN").astype(np.float32)
-        self.wzx_channels = build_wzx_style_channels_rows(raw_flux[self.indices], raw_clean[self.indices])
+        raw_clean = (
+            read_image(train_fits, "FLUX_CLEAN").astype(np.float32)
+            if wzx_feature_requires_clean(wzx_feature_mode)
+            else None
+        )
+        self.wzx_channels = build_wzx_feature_channels_rows(
+            raw_flux[self.indices],
+            None if raw_clean is None else raw_clean[self.indices],
+            wzx_feature_mode,
+        )
 
     def __getitem__(self, row: int):
         hybrid, center, region, lognhi, mask, offset, offset_weight, count, index = super().__getitem__(row)
@@ -57,11 +75,22 @@ class DualFusionTrainDataset(HybridTrainDataset):
 
 
 class DualFusionTestDataset(HybridTestDataset):
-    def __init__(self, test_fits: str | Path):
-        super().__init__(test_fits, input_mode="all")
+    def __init__(
+        self,
+        test_fits: str | Path,
+        dilated_input_mode: str = "all",
+        wzx_feature_mode: str = "all",
+    ):
+        self.dilated_input_mode = dilated_input_mode
+        self.wzx_feature_mode = wzx_feature_mode
+        super().__init__(test_fits, input_mode=dilated_input_mode)
         raw_flux = read_image(test_fits, "FLUX").astype(np.float32)
-        raw_clean = read_image(test_fits, "FLUX_CLEAN").astype(np.float32)
-        self.wzx_channels = build_wzx_style_channels_rows(raw_flux, raw_clean)
+        raw_clean = (
+            read_image(test_fits, "FLUX_CLEAN").astype(np.float32)
+            if wzx_feature_requires_clean(wzx_feature_mode)
+            else None
+        )
+        self.wzx_channels = build_wzx_feature_channels_rows(raw_flux, raw_clean, wzx_feature_mode)
 
     def __getitem__(self, row: int):
         hybrid, index = super().__getitem__(row)

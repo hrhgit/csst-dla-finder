@@ -31,14 +31,70 @@ def resolve_device(name: str) -> torch.device:
 def load_checkpoint(path: str | Path, device: torch.device):
     ckpt = torch.load(path, map_location=device)
     cfg = ckpt["config"]
-    model = HybridDlaNet(
-        input_channels(cfg["input_mode"]),
-        hidden=int(cfg.get("hidden", 32)),
-        num_blocks=int(cfg.get("num_blocks", 6)),
-        with_offset=bool(cfg.get("with_offset", False)),
-        norm_type=str(cfg.get("norm_type", "layer")),
-        head_layers=int(cfg.get("head_layers", 1)),
-    ).to(device)
+    arch = str(cfg.get("arch", "dilated")).lower()
+    if arch == "transformer":
+        from models.transformer_5head import _build_transformer_5head
+        model = _build_transformer_5head(
+            in_channels=int(cfg.get("in_channels", input_channels(cfg["input_mode"]))),
+            d_model=int(cfg.get("d_model", 192)),
+            nhead=int(cfg.get("nhead", 8)),
+            num_layers=int(cfg.get("num_layers", 4)),
+            dim_ff=int(cfg.get("dim_ff", 768)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            use_offset=bool(cfg.get("use_offset", True)),
+            max_len=int(cfg.get("max_len", 1024)),
+        ).to(device)
+    elif arch == "transformer_conv_stem":
+        from models.transformer_conv_stem_5head import _build_transformer_conv_stem_5head
+        model = _build_transformer_conv_stem_5head(
+            in_channels=int(cfg.get("in_channels", input_channels(cfg["input_mode"]))),
+            d_model=int(cfg.get("d_model", 192)),
+            nhead=int(cfg.get("nhead", 8)),
+            num_layers=int(cfg.get("num_layers", 4)),
+            dim_ff=int(cfg.get("dim_ff", 768)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            conv_kernel=int(cfg.get("conv_kernel", 7)),
+            num_conv_layers=int(cfg.get("num_conv_layers", 1)),
+            use_offset=bool(cfg.get("use_offset", True)),
+            max_len=int(cfg.get("max_len", 1024)),
+        ).to(device)
+    elif arch == "transformer_conv_stem_rope":
+        from models.transformer_conv_stem_rope_5head import _build_transformer_conv_stem_rope_5head
+        model = _build_transformer_conv_stem_rope_5head(
+            in_channels=int(cfg.get("in_channels", input_channels(cfg["input_mode"]))),
+            d_model=int(cfg.get("d_model", 192)),
+            nhead=int(cfg.get("nhead", 8)),
+            num_layers=int(cfg.get("num_layers", 4)),
+            dim_ff=int(cfg.get("dim_ff", 768)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            conv_kernel=int(cfg.get("conv_kernel", 7)),
+            num_conv_layers=int(cfg.get("num_conv_layers", 1)),
+            use_offset=bool(cfg.get("use_offset", True)),
+            max_len=int(cfg.get("max_len", 1024)),
+        ).to(device)
+    elif arch == "transformer_conv_stem_alibi":
+        from models.transformer_conv_stem_alibi_5head import _build_transformer_conv_stem_alibi_5head
+        model = _build_transformer_conv_stem_alibi_5head(
+            in_channels=int(cfg.get("in_channels", input_channels(cfg["input_mode"]))),
+            d_model=int(cfg.get("d_model", 192)),
+            nhead=int(cfg.get("nhead", 8)),
+            num_layers=int(cfg.get("num_layers", 4)),
+            dim_ff=int(cfg.get("dim_ff", 768)),
+            dropout=float(cfg.get("dropout", 0.1)),
+            conv_kernel=int(cfg.get("conv_kernel", 7)),
+            num_conv_layers=int(cfg.get("num_conv_layers", 1)),
+            use_offset=bool(cfg.get("use_offset", True)),
+            max_len=int(cfg.get("max_len", 1024)),
+        ).to(device)
+    else:
+        model = HybridDlaNet(
+            input_channels(cfg["input_mode"]),
+            hidden=int(cfg.get("hidden", 32)),
+            num_blocks=int(cfg.get("num_blocks", 6)),
+            with_offset=bool(cfg.get("with_offset", False)),
+            norm_type=str(cfg.get("norm_type", "layer")),
+            head_layers=int(cfg.get("head_layers", 1)),
+        ).to(device)
     model.load_state_dict(ckpt["model_state"])
     return model, cfg
 

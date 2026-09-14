@@ -14,6 +14,12 @@ def input_channels(input_mode: str) -> int:
         return 1
     if input_mode == "flux":
         return 6
+    if input_mode == "flux_aug":
+        return 8
+    if input_mode == "flux_sig":
+        return 7
+    if input_mode == "flux_feat":
+        return 9
     if input_mode == "residual":
         return 7
     if input_mode == "all":

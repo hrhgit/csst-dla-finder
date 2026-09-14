@@ -77,7 +77,18 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     model, checkpoint = load_fusion(args.checkpoint, device)
-    dataset = DualFusionTestDataset(args.test_fits)
+    fusion_config = checkpoint["config"]
+    dilated_input_mode = str(
+        fusion_config.get("dilated_input_mode", fusion_config.get("dilated_config", {}).get("input_mode", "all"))
+    )
+    wzx_feature_mode = str(
+        fusion_config.get("wzx_feature_mode", fusion_config.get("wzx_config", {}).get("feature_mode", "all"))
+    )
+    dataset = DualFusionTestDataset(
+        args.test_fits,
+        dilated_input_mode=dilated_input_mode,
+        wzx_feature_mode=wzx_feature_mode,
+    )
     prediction = predict(model, dataset, device, args.batch_size)
     config = {
         "threshold": float(args.threshold if args.threshold is not None else checkpoint.get("threshold", 0.45)),
